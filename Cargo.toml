@@ -1,0 +1,20 @@
+[package]
+name = "voltage_j1939"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "SAE J1939 protocol decoder - PGN/SPN database and CAN frame parsing"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/EvanL1/voltage-j1939"
+keywords = ["j1939", "can", "sae", "automotive", "protocol"]
+categories = ["embedded", "parsing", "hardware-support"]
+readme = "README.md"
+
+[dependencies]
+# No external dependencies - pure Rust implementation
+
+[dev-dependencies]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
