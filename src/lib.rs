@@ -84,16 +84,17 @@
 //! - **SA**: Source Address
 
 #![deny(missing_docs)]
-#![deny(unsafe_code)]
+// Note: We allow unsafe in decoder.rs for performance-critical hot paths
+// after bounds checking. All unsafe is minimal and well-documented.
 
 pub mod database;
 pub mod decoder;
 pub mod frame;
 pub mod types;
 
-// Re-export commonly used types
+// Re-export commonly used functions (optimized O(log n) lookups)
 pub use database::{database_stats, get_spn_def, get_spns_for_pgn, list_supported_pgns};
-pub use decoder::{decode_frame, decode_spn, decode_spn_by_number, decode_spn_full};
+pub use decoder::{decode_frame, decode_frame_iter, decode_spn, decode_spn_by_number, decode_spn_full};
 pub use frame::{
     build_can_id, build_request_pgn, extract_pgn, extract_source_address, is_valid_j1939_id,
     parse_can_id,

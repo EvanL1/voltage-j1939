@@ -6,9 +6,116 @@
 //! This database covers the most commonly used PGNs for diesel generators and
 //! industrial engines. Data is automatically decoded when matching PGNs are received.
 
-use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crate::types::{SpnDataType, SpnDef};
+
+// ============================================================================
+// Lazy-initialized lookup tables for O(1) access
+// ============================================================================
+
+/// Cached PGN -> SPNs mapping (lazy initialized)
+static PGN_LOOKUP: OnceLock<PgnLookup> = OnceLock::new();
+
+/// Cached SPN -> SpnDef mapping (lazy initialized)
+static SPN_LOOKUP: OnceLock<SpnLookup> = OnceLock::new();
+
+/// Compact PGN lookup structure
+struct PgnLookup {
+    /// Sorted list of (pgn, start_idx, count) for binary search
+    index: Vec<(u32, u16, u16)>,
+    /// Flattened array of SpnDef references, grouped by PGN
+    spns: Vec<&'static SpnDef>,
+}
+
+/// Compact SPN lookup using sorted array + binary search (faster than HashMap for small N)
+struct SpnLookup {
+    /// Sorted by SPN number for binary search
+    entries: Vec<(u32, &'static SpnDef)>,
+}
+
+impl PgnLookup {
+    fn build() -> Self {
+        // O(n log n): Sort SPNs by PGN first
+        let mut sorted_spns: Vec<&'static SpnDef> = SPN_DEFINITIONS.iter().collect();
+        sorted_spns.sort_unstable_by_key(|s| s.pgn);
+
+        // O(n): Single pass to build index and collect SPNs
+        let mut index: Vec<(u32, u16, u16)> = Vec::new();
+        let mut current_pgn = u32::MAX;
+        let mut start_idx = 0u16;
+
+        for (i, spn) in sorted_spns.iter().enumerate() {
+            if spn.pgn != current_pgn {
+                // Finalize previous PGN group
+                if current_pgn != u32::MAX {
+                    let count = (i as u16) - start_idx;
+                    index.push((current_pgn, start_idx, count));
+                }
+                current_pgn = spn.pgn;
+                start_idx = i as u16;
+            }
+        }
+        // Finalize last PGN group
+        if current_pgn != u32::MAX {
+            let count = (sorted_spns.len() as u16) - start_idx;
+            index.push((current_pgn, start_idx, count));
+        }
+
+        Self {
+            index,
+            spns: sorted_spns,
+        }
+    }
+
+    #[inline]
+    fn get(&self, pgn: u32) -> Option<&[&'static SpnDef]> {
+        self.index
+            .binary_search_by_key(&pgn, |(p, _, _)| *p)
+            .ok()
+            .map(|idx| {
+                let (_, start, count) = self.index[idx];
+                &self.spns[start as usize..(start + count) as usize]
+            })
+    }
+
+    #[inline]
+    fn pgn_count(&self) -> usize {
+        self.index.len()
+    }
+
+    #[inline]
+    fn iter_pgns(&self) -> impl Iterator<Item = u32> + '_ {
+        self.index.iter().map(|(pgn, _, _)| *pgn)
+    }
+}
+
+impl SpnLookup {
+    fn build() -> Self {
+        let mut entries: Vec<(u32, &'static SpnDef)> =
+            SPN_DEFINITIONS.iter().map(|s| (s.spn, s)).collect();
+        entries.sort_unstable_by_key(|(spn, _)| *spn);
+        Self { entries }
+    }
+
+    #[inline]
+    fn get(&self, spn: u32) -> Option<&'static SpnDef> {
+        self.entries
+            .binary_search_by_key(&spn, |(s, _)| *s)
+            .ok()
+            .map(|idx| self.entries[idx].1)
+    }
+}
+
+#[inline]
+fn pgn_lookup() -> &'static PgnLookup {
+    PGN_LOOKUP.get_or_init(PgnLookup::build)
+}
+
+#[inline]
+fn spn_lookup() -> &'static SpnLookup {
+    SPN_LOOKUP.get_or_init(SpnLookup::build)
+}
 
 // ============================================================================
 // SPN Database - Complete definitions for common engine PGNs
@@ -927,28 +1034,12 @@ pub static SPN_DEFINITIONS: &[SpnDef] = &[
 ];
 
 // ============================================================================
-// Database lookup functions
+// Database lookup functions - O(log n) via binary search
 // ============================================================================
 
-/// Build PGN to SPNs mapping.
-pub fn build_pgn_database() -> HashMap<u32, Vec<&'static SpnDef>> {
-    let mut map: HashMap<u32, Vec<&'static SpnDef>> = HashMap::new();
-    for spn in SPN_DEFINITIONS {
-        map.entry(spn.pgn).or_default().push(spn);
-    }
-    map
-}
-
-/// Build SPN to definition mapping.
-pub fn build_spn_database() -> HashMap<u32, &'static SpnDef> {
-    let mut map = HashMap::new();
-    for spn in SPN_DEFINITIONS {
-        map.insert(spn.spn, spn);
-    }
-    map
-}
-
 /// Get all SPNs for a given PGN.
+///
+/// Returns a slice of SPN definitions. O(log n) lookup via binary search.
 ///
 /// # Example
 ///
@@ -962,16 +1053,14 @@ pub fn build_spn_database() -> HashMap<u32, &'static SpnDef> {
 ///     }
 /// }
 /// ```
-pub fn get_spns_for_pgn(pgn: u32) -> Option<Vec<&'static SpnDef>> {
-    let result: Vec<_> = SPN_DEFINITIONS.iter().filter(|s| s.pgn == pgn).collect();
-    if result.is_empty() {
-        None
-    } else {
-        Some(result)
-    }
+#[inline]
+pub fn get_spns_for_pgn(pgn: u32) -> Option<&'static [&'static SpnDef]> {
+    pgn_lookup().get(pgn)
 }
 
 /// Get a specific SPN definition by SPN number.
+///
+/// O(log n) lookup via binary search.
 ///
 /// # Example
 ///
@@ -983,24 +1072,24 @@ pub fn get_spns_for_pgn(pgn: u32) -> Option<Vec<&'static SpnDef>> {
 ///     println!("Name: {}, Scale: {}", spn.name, spn.scale);
 /// }
 /// ```
+#[inline]
 pub fn get_spn_def(spn: u32) -> Option<&'static SpnDef> {
-    SPN_DEFINITIONS.iter().find(|s| s.spn == spn)
+    spn_lookup().get(spn)
 }
 
 /// Get statistics about the database.
 ///
 /// Returns (number of unique PGNs, total number of SPNs).
+/// O(1) after first call (cached).
+#[inline]
 pub fn database_stats() -> (usize, usize) {
-    let pgn_count = build_pgn_database().len();
-    let spn_count = SPN_DEFINITIONS.len();
-    (pgn_count, spn_count)
+    (pgn_lookup().pgn_count(), SPN_DEFINITIONS.len())
 }
 
-/// List all supported PGNs.
-pub fn list_supported_pgns() -> Vec<u32> {
-    let mut pgns: Vec<u32> = build_pgn_database().keys().copied().collect();
-    pgns.sort();
-    pgns
+/// List all supported PGNs (already sorted).
+#[inline]
+pub fn list_supported_pgns() -> impl Iterator<Item = u32> {
+    pgn_lookup().iter_pgns()
 }
 
 #[cfg(test)]
@@ -1049,7 +1138,7 @@ mod tests {
 
     #[test]
     fn test_list_supported_pgns() {
-        let pgns = list_supported_pgns();
+        let pgns: Vec<_> = list_supported_pgns().collect();
         assert!(!pgns.is_empty());
         assert!(pgns.contains(&61444)); // EEC1
         assert!(pgns.contains(&65262)); // ET1
