@@ -34,7 +34,7 @@ const PDU2_THRESHOLD: u8 = 240;
 /// assert_eq!(id.pgn, 61444);  // EEC1
 /// assert_eq!(id.source_address, 0x00);
 /// ```
-#[inline]
+#[inline(always)]
 pub fn parse_can_id(can_id: u32) -> J1939Id {
     // Extract all fields in one pass using bit operations
     let sa = can_id as u8;
@@ -150,7 +150,8 @@ pub const fn is_valid_j1939_id(can_id: u32) -> bool {
 /// Extract just the PGN from a CAN ID without full parsing.
 ///
 /// This is a faster alternative to `parse_can_id` when you only need the PGN.
-#[inline]
+/// Hot path: always inlined for frame decoding.
+#[inline(always)]
 pub const fn extract_pgn(can_id: u32) -> u32 {
     let ps = (can_id >> 8) as u8;
     let pf = (can_id >> 16) as u8;

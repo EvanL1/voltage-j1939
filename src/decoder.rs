@@ -6,12 +6,16 @@ use crate::database::{get_spn_def, get_spns_for_pgn};
 use crate::frame::extract_pgn;
 use crate::types::{DecodedSpn, SpnDataType, SpnDef};
 
-/// Precomputed "not available" thresholds for each bit length (0-64)
+/// Precomputed "not available" thresholds for each bit length (0-64).
+/// Computed at compile time via const fn - zero runtime overhead.
+///
 /// Value at index N = (2^N - 3), the threshold above which a value is special.
 /// J1939 reserves the last two values: (2^N - 2) = error, (2^N - 1) = not available.
 /// For N=0 or N=1, we use 0 (no valid values for degenerate cases).
-/// For N>=64, saturates to u64::MAX-2.
-const NOT_AVAILABLE_THRESHOLD: [u64; 65] = {
+const NOT_AVAILABLE_THRESHOLD: [u64; 65] = compute_thresholds();
+
+/// Compute threshold table at compile time.
+const fn compute_thresholds() -> [u64; 65] {
     let mut table = [0u64; 65];
     // For 0 and 1 bit, threshold is 0 (special handling)
     let mut i = 2usize;
@@ -21,11 +25,19 @@ const NOT_AVAILABLE_THRESHOLD: [u64; 65] = {
     }
     table[64] = u64::MAX - 2;
     table
+}
+
+// Compile-time verification of critical threshold values
+const _: () = {
+    assert!(NOT_AVAILABLE_THRESHOLD[8] == 253); // 8-bit: 0-253 valid
+    assert!(NOT_AVAILABLE_THRESHOLD[16] == 65533); // 16-bit: 0-65533 valid
+    assert!(NOT_AVAILABLE_THRESHOLD[32] == 0xFFFF_FFFD); // 32-bit
 };
 
 /// Extract raw value and check validity in one pass.
 /// Returns (raw_value, scaled_value) if valid.
-#[inline]
+/// Hot path: inlined for maximum performance.
+#[inline(always)]
 fn extract_and_validate(data: &[u8], spn_def: &SpnDef) -> Option<(u64, f64)> {
     let raw_value = extract_raw_value(data, spn_def)?;
 
@@ -43,6 +55,7 @@ fn extract_and_validate(data: &[u8], spn_def: &SpnDef) -> Option<(u64, f64)> {
 /// Decode a single SPN from CAN data bytes.
 ///
 /// Returns `None` if the data is too short or the value indicates "not available".
+/// Hot path: always inlined.
 ///
 /// # Example
 ///
@@ -59,12 +72,13 @@ fn extract_and_validate(data: &[u8], spn_def: &SpnDef) -> Option<(u64, f64)> {
 ///     assert_eq!(value, 90.0);
 /// }
 /// ```
-#[inline]
+#[inline(always)]
 pub fn decode_spn(data: &[u8], spn_def: &SpnDef) -> Option<f64> {
     extract_and_validate(data, spn_def).map(|(_, value)| value)
 }
 
 /// Decode a single SPN and return full decoded information.
+/// Hot path for decode_frame_iter - always inlined.
 ///
 /// # Example
 ///
@@ -79,7 +93,7 @@ pub fn decode_spn(data: &[u8], spn_def: &SpnDef) -> Option<f64> {
 ///     println!("SPN {}: {} = {} {}", decoded.spn, decoded.name, decoded.value, decoded.unit);
 /// }
 /// ```
-#[inline]
+#[inline(always)]
 pub fn decode_spn_full(data: &[u8], spn_def: &SpnDef) -> Option<DecodedSpn> {
     let (raw_value, value) = extract_and_validate(data, spn_def)?;
     Some(DecodedSpn {
@@ -94,7 +108,7 @@ pub fn decode_spn_full(data: &[u8], spn_def: &SpnDef) -> Option<DecodedSpn> {
 /// Decode all known SPNs from a CAN frame (zero-allocation iterator).
 ///
 /// This is the preferred method for performance-critical code as it
-/// avoids heap allocation entirely.
+/// avoids heap allocation entirely. Always inlined for maximum performance.
 ///
 /// # Arguments
 ///
@@ -117,7 +131,7 @@ pub fn decode_spn_full(data: &[u8], spn_def: &SpnDef) -> Option<DecodedSpn> {
 ///     println!("{}: {} {}", spn.name, spn.value, spn.unit);
 /// }
 /// ```
-#[inline]
+#[inline(always)]
 pub fn decode_frame_iter(
     can_id: u32,
     data: &[u8],
@@ -132,6 +146,7 @@ pub fn decode_frame_iter(
 /// Decode all known SPNs from a CAN frame.
 ///
 /// For zero-allocation iteration, use [`decode_frame_iter`] instead.
+/// This allocates a Vec - prefer decode_frame_iter for hot paths.
 ///
 /// # Arguments
 ///
@@ -156,12 +171,13 @@ pub fn decode_frame_iter(
 ///     println!("{}: {} {}", spn.name, spn.value, spn.unit);
 /// }
 /// ```
-#[inline]
+#[inline(always)]
 pub fn decode_frame(can_id: u32, data: &[u8]) -> Vec<DecodedSpn> {
     decode_frame_iter(can_id, data).collect()
 }
 
 /// Decode a specific SPN by number from a CAN frame.
+/// Always inlined for direct SPN decoding hot path.
 ///
 /// # Arguments
 ///
@@ -171,7 +187,7 @@ pub fn decode_frame(can_id: u32, data: &[u8]) -> Vec<DecodedSpn> {
 /// # Returns
 ///
 /// The decoded value, or `None` if the SPN is not found or data is invalid.
-#[inline]
+#[inline(always)]
 pub fn decode_spn_by_number(spn: u32, data: &[u8]) -> Option<f64> {
     decode_spn(data, get_spn_def(spn)?)
 }
@@ -182,7 +198,8 @@ pub fn decode_spn_by_number(spn: u32, data: &[u8]) -> Option<f64> {
 
 /// Extract raw value from data bytes based on SPN definition.
 /// Uses unsafe get_unchecked after bounds check for optimal codegen.
-#[inline]
+/// Hot path: always inlined for zero function call overhead.
+#[inline(always)]
 fn extract_raw_value(data: &[u8], spn_def: &SpnDef) -> Option<u64> {
     let start = spn_def.start_byte as usize;
     let required_len = start + spn_def.data_type.byte_size();

@@ -20,18 +20,20 @@ static PGN_LOOKUP: OnceLock<PgnLookup> = OnceLock::new();
 /// Cached SPN -> SpnDef mapping (lazy initialized)
 static SPN_LOOKUP: OnceLock<SpnLookup> = OnceLock::new();
 
-/// Compact PGN lookup structure
+/// Compact PGN lookup structure using Box<[T]> for minimal memory footprint.
+/// Box<[T]> saves 8 bytes per field vs Vec (no capacity field needed).
 struct PgnLookup {
     /// Sorted list of (pgn, start_idx, count) for binary search
-    index: Vec<(u32, u16, u16)>,
+    index: Box<[(u32, u16, u16)]>,
     /// Flattened array of SpnDef references, grouped by PGN
-    spns: Vec<&'static SpnDef>,
+    spns: Box<[&'static SpnDef]>,
 }
 
-/// Compact SPN lookup using sorted array + binary search (faster than HashMap for small N)
+/// Compact SPN lookup using sorted array + binary search (faster than HashMap for small N).
+/// Box<[T]> saves 8 bytes vs Vec (no capacity field needed).
 struct SpnLookup {
     /// Sorted by SPN number for binary search
-    entries: Vec<(u32, &'static SpnDef)>,
+    entries: Box<[(u32, &'static SpnDef)]>,
 }
 
 impl PgnLookup {
@@ -40,8 +42,15 @@ impl PgnLookup {
         let mut sorted_spns: Vec<&'static SpnDef> = SPN_DEFINITIONS.iter().collect();
         sorted_spns.sort_unstable_by_key(|s| s.pgn);
 
-        // O(n): Single pass to build index and collect SPNs
-        let mut index: Vec<(u32, u16, u16)> = Vec::new();
+        // Count unique PGNs for pre-allocation (O(n) but worth it for no realloc)
+        let pgn_count = sorted_spns
+            .windows(2)
+            .filter(|w| w[0].pgn != w[1].pgn)
+            .count()
+            + 1;
+
+        // O(n): Single pass to build index
+        let mut index: Vec<(u32, u16, u16)> = Vec::with_capacity(pgn_count);
         let mut current_pgn = u32::MAX;
         let mut start_idx = 0u16;
 
@@ -63,20 +72,21 @@ impl PgnLookup {
         }
 
         Self {
-            index,
-            spns: sorted_spns,
+            index: index.into_boxed_slice(),
+            spns: sorted_spns.into_boxed_slice(),
         }
     }
 
-    #[inline]
+    /// Hot path for frame decoding - always inlined.
+    #[inline(always)]
     fn get(&self, pgn: u32) -> Option<&[&'static SpnDef]> {
-        self.index
-            .binary_search_by_key(&pgn, |(p, _, _)| *p)
-            .ok()
-            .map(|idx| {
+        match self.index.binary_search_by_key(&pgn, |(p, _, _)| *p) {
+            Ok(idx) => {
                 let (_, start, count) = self.index[idx];
-                &self.spns[start as usize..(start + count) as usize]
-            })
+                Some(&self.spns[start as usize..(start + count) as usize])
+            }
+            Err(_) => None, // PGN not found - cold path
+        }
     }
 
     #[inline]
@@ -92,27 +102,36 @@ impl PgnLookup {
 
 impl SpnLookup {
     fn build() -> Self {
+        // Pre-allocate with exact capacity
         let mut entries: Vec<(u32, &'static SpnDef)> =
-            SPN_DEFINITIONS.iter().map(|s| (s.spn, s)).collect();
+            Vec::with_capacity(SPN_DEFINITIONS.len());
+        entries.extend(SPN_DEFINITIONS.iter().map(|s| (s.spn, s)));
         entries.sort_unstable_by_key(|(spn, _)| *spn);
-        Self { entries }
+        Self {
+            entries: entries.into_boxed_slice(),
+        }
     }
 
-    #[inline]
+    /// SPN lookup - inlined for decode_spn_by_number hot path.
+    #[inline(always)]
     fn get(&self, spn: u32) -> Option<&'static SpnDef> {
-        self.entries
-            .binary_search_by_key(&spn, |(s, _)| *s)
-            .ok()
-            .map(|idx| self.entries[idx].1)
+        match self.entries.binary_search_by_key(&spn, |(s, _)| *s) {
+            Ok(idx) => Some(self.entries[idx].1),
+            Err(_) => None, // SPN not found - cold path
+        }
     }
 }
 
-#[inline]
+/// Get PGN lookup table - initialized once, then O(1) access.
+/// Hot path: always inlined to avoid function call overhead.
+#[inline(always)]
 fn pgn_lookup() -> &'static PgnLookup {
     PGN_LOOKUP.get_or_init(PgnLookup::build)
 }
 
-#[inline]
+/// Get SPN lookup table - initialized once, then O(1) access.
+/// Hot path: always inlined to avoid function call overhead.
+#[inline(always)]
 fn spn_lookup() -> &'static SpnLookup {
     SPN_LOOKUP.get_or_init(SpnLookup::build)
 }
@@ -1040,6 +1059,7 @@ pub static SPN_DEFINITIONS: &[SpnDef] = &[
 /// Get all SPNs for a given PGN.
 ///
 /// Returns a slice of SPN definitions. O(log n) lookup via binary search.
+/// Hot path: always inlined for frame decoding.
 ///
 /// # Example
 ///
@@ -1053,7 +1073,7 @@ pub static SPN_DEFINITIONS: &[SpnDef] = &[
 ///     }
 /// }
 /// ```
-#[inline]
+#[inline(always)]
 pub fn get_spns_for_pgn(pgn: u32) -> Option<&'static [&'static SpnDef]> {
     pgn_lookup().get(pgn)
 }
@@ -1061,6 +1081,7 @@ pub fn get_spns_for_pgn(pgn: u32) -> Option<&'static [&'static SpnDef]> {
 /// Get a specific SPN definition by SPN number.
 ///
 /// O(log n) lookup via binary search.
+/// Hot path: always inlined for decode_spn_by_number.
 ///
 /// # Example
 ///
@@ -1072,7 +1093,7 @@ pub fn get_spns_for_pgn(pgn: u32) -> Option<&'static [&'static SpnDef]> {
 ///     println!("Name: {}, Scale: {}", spn.name, spn.scale);
 /// }
 /// ```
-#[inline]
+#[inline(always)]
 pub fn get_spn_def(spn: u32) -> Option<&'static SpnDef> {
     spn_lookup().get(spn)
 }
