@@ -36,36 +36,36 @@ struct SpnLookup {
 
 impl PgnLookup {
     fn build() -> Self {
-        // First pass: count SPNs per PGN
-        let mut pgn_counts: Vec<(u32, u16)> = Vec::new();
-        for spn in SPN_DEFINITIONS {
-            if let Some(entry) = pgn_counts.iter_mut().find(|(p, _)| *p == spn.pgn) {
-                entry.1 += 1;
-            } else {
-                pgn_counts.push((spn.pgn, 1));
-            }
-        }
-        pgn_counts.sort_unstable_by_key(|(pgn, _)| *pgn);
+        // O(n log n): Sort SPNs by PGN first
+        let mut sorted_spns: Vec<&'static SpnDef> = SPN_DEFINITIONS.iter().collect();
+        sorted_spns.sort_unstable_by_key(|s| s.pgn);
 
-        // Build index with start positions
-        let mut index = Vec::with_capacity(pgn_counts.len());
-        let mut offset = 0u16;
-        for (pgn, count) in &pgn_counts {
-            index.push((*pgn, offset, *count));
-            offset += count;
-        }
+        // O(n): Single pass to build index and collect SPNs
+        let mut index: Vec<(u32, u16, u16)> = Vec::new();
+        let mut current_pgn = u32::MAX;
+        let mut start_idx = 0u16;
 
-        // Build flattened SPN array grouped by PGN
-        let mut spns: Vec<&'static SpnDef> = Vec::with_capacity(SPN_DEFINITIONS.len());
-        for (pgn, _, _) in &index {
-            for spn in SPN_DEFINITIONS {
-                if spn.pgn == *pgn {
-                    spns.push(spn);
+        for (i, spn) in sorted_spns.iter().enumerate() {
+            if spn.pgn != current_pgn {
+                // Finalize previous PGN group
+                if current_pgn != u32::MAX {
+                    let count = (i as u16) - start_idx;
+                    index.push((current_pgn, start_idx, count));
                 }
+                current_pgn = spn.pgn;
+                start_idx = i as u16;
             }
         }
+        // Finalize last PGN group
+        if current_pgn != u32::MAX {
+            let count = (sorted_spns.len() as u16) - start_idx;
+            index.push((current_pgn, start_idx, count));
+        }
 
-        Self { index, spns }
+        Self {
+            index,
+            spns: sorted_spns,
+        }
     }
 
     #[inline]
