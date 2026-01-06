@@ -91,7 +91,7 @@ pub mod decoder;
 pub mod frame;
 pub mod types;
 
-// Re-export commonly used types
+// Re-export commonly used functions (optimized O(log n) lookups)
 pub use database::{database_stats, get_spn_def, get_spns_for_pgn, list_supported_pgns};
 pub use decoder::{decode_frame, decode_spn, decode_spn_by_number, decode_spn_full};
 pub use frame::{

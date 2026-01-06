@@ -1,8 +1,12 @@
 //! J1939 CAN frame parsing.
 //!
 //! Provides utilities for parsing and building J1939 29-bit extended CAN IDs.
+//! All functions are `#[inline]` for zero-cost abstraction.
 
 use crate::types::J1939Id;
+
+/// PDU2 format threshold (PF >= 240 means broadcast)
+const PDU2_THRESHOLD: u8 = 240;
 
 /// Parse a 29-bit J1939 CAN ID into its components.
 ///
@@ -30,24 +34,24 @@ use crate::types::J1939Id;
 /// assert_eq!(id.pgn, 61444);  // EEC1
 /// assert_eq!(id.source_address, 0x00);
 /// ```
+#[inline]
 pub fn parse_can_id(can_id: u32) -> J1939Id {
-    let sa = (can_id & 0xFF) as u8;
-    let ps = ((can_id >> 8) & 0xFF) as u8;
-    let pf = ((can_id >> 16) & 0xFF) as u8;
-    let dp = ((can_id >> 24) & 0x01) as u8;
+    // Extract all fields in one pass using bit operations
+    let sa = can_id as u8;
+    let ps = (can_id >> 8) as u8;
+    let pf = (can_id >> 16) as u8;
+    let dp = (can_id >> 24) & 0x01;
     let priority = ((can_id >> 26) & 0x07) as u8;
 
     // Calculate PGN based on PDU format
     // PDU1 (PF < 240): PGN = DP.PF.00, PS is destination address
     // PDU2 (PF >= 240): PGN = DP.PF.PS, PS is part of PGN
-    let (pgn, destination_address) = if pf >= 240 {
+    let (pgn, destination_address) = if pf >= PDU2_THRESHOLD {
         // PDU2 format - broadcast
-        let pgn = ((dp as u32) << 16) | ((pf as u32) << 8) | (ps as u32);
-        (pgn, 0xFF) // 0xFF = global address
+        ((dp << 16) | ((pf as u32) << 8) | (ps as u32), 0xFF)
     } else {
         // PDU1 format - peer-to-peer
-        let pgn = ((dp as u32) << 16) | ((pf as u32) << 8);
-        (pgn, ps)
+        ((dp << 16) | ((pf as u32) << 8), ps)
     };
 
     J1939Id {
@@ -75,9 +79,13 @@ pub fn parse_can_id(can_id: u32) -> J1939Id {
 /// let can_id = build_can_id(&id);
 /// assert_eq!(can_id, 0x18EA00FE);
 /// ```
+#[inline]
 pub fn build_can_id(id: &J1939Id) -> u32 {
     id.to_can_id()
 }
+
+/// Request PGN constant
+const REQUEST_PGN: u32 = 0xEA00;
 
 /// Build a Request PGN CAN frame.
 ///
@@ -104,58 +112,61 @@ pub fn build_can_id(id: &J1939Id) -> u32 {
 /// // can_id = 0x18EA00FE (Request PGN from 0xFE to 0x00)
 /// // data = [0xE5, 0xFE, 0x00] (PGN 65253 in little-endian)
 /// ```
+#[inline]
 pub fn build_request_pgn(
     source_address: u8,
     destination_address: u8,
     requested_pgn: u32,
 ) -> (u32, [u8; 3]) {
-    let id = J1939Id {
-        priority: 6, // Default priority for request
-        pgn: 0xEA00, // Request PGN
-        source_address,
-        destination_address,
-    };
+    // Build CAN ID directly without intermediate struct
+    // Priority 6, DP=0, PF=0xEA, PS=destination_address, SA=source_address
+    let can_id = (6u32 << 26)
+        | ((REQUEST_PGN & 0xFF00) << 8)
+        | ((destination_address as u32) << 8)
+        | (source_address as u32);
 
-    let can_id = id.to_can_id();
+    // Convert PGN to little-endian bytes directly
     let data = [
-        (requested_pgn & 0xFF) as u8,
-        ((requested_pgn >> 8) & 0xFF) as u8,
-        ((requested_pgn >> 16) & 0xFF) as u8,
+        requested_pgn as u8,
+        (requested_pgn >> 8) as u8,
+        (requested_pgn >> 16) as u8,
     ];
 
     (can_id, data)
 }
+
+/// Maximum valid 29-bit CAN ID
+const MAX_29BIT_ID: u32 = 0x1FFFFFFF;
 
 /// Check if a CAN ID is a valid J1939 extended frame.
 ///
 /// J1939 uses 29-bit extended CAN IDs. This function checks that the ID
 /// is within the valid range and has reasonable J1939 structure.
 #[inline]
-pub fn is_valid_j1939_id(can_id: u32) -> bool {
-    // Must be within 29-bit range
-    can_id <= 0x1FFFFFFF
+pub const fn is_valid_j1939_id(can_id: u32) -> bool {
+    can_id <= MAX_29BIT_ID
 }
 
 /// Extract just the PGN from a CAN ID without full parsing.
 ///
 /// This is a faster alternative to `parse_can_id` when you only need the PGN.
 #[inline]
-pub fn extract_pgn(can_id: u32) -> u32 {
-    let ps = ((can_id >> 8) & 0xFF) as u8;
-    let pf = ((can_id >> 16) & 0xFF) as u8;
-    let dp = ((can_id >> 24) & 0x01) as u8;
+pub const fn extract_pgn(can_id: u32) -> u32 {
+    let ps = (can_id >> 8) as u8;
+    let pf = (can_id >> 16) as u8;
+    let dp = (can_id >> 24) & 0x01;
 
-    if pf >= 240 {
-        ((dp as u32) << 16) | ((pf as u32) << 8) | (ps as u32)
+    if pf >= PDU2_THRESHOLD {
+        (dp << 16) | ((pf as u32) << 8) | (ps as u32)
     } else {
-        ((dp as u32) << 16) | ((pf as u32) << 8)
+        (dp << 16) | ((pf as u32) << 8)
     }
 }
 
 /// Extract just the source address from a CAN ID.
 #[inline]
-pub fn extract_source_address(can_id: u32) -> u8 {
-    (can_id & 0xFF) as u8
+pub const fn extract_source_address(can_id: u32) -> u8 {
+    can_id as u8
 }
 
 #[cfg(test)]

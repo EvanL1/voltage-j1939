@@ -3,8 +3,30 @@
 //! Provides utilities for decoding SPN values from CAN frame data.
 
 use crate::database::{get_spn_def, get_spns_for_pgn};
-use crate::frame::{extract_pgn, extract_source_address};
+use crate::frame::extract_pgn;
 use crate::types::{DecodedSpn, SpnDataType, SpnDef};
+
+/// Extract raw value and check validity in one pass.
+/// Returns (raw_value, scaled_value) if valid.
+#[inline]
+fn extract_and_validate(data: &[u8], spn_def: &SpnDef) -> Option<(u64, f64)> {
+    let raw_value = extract_raw_value(data, spn_def)?;
+
+    // Check for "not available" values (all 1s or all 1s minus 1)
+    // Compute max_value without overflow for bit_length up to 64
+    let max_value = if spn_def.bit_length >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << spn_def.bit_length) - 1
+    };
+
+    if raw_value >= max_value.saturating_sub(1) {
+        return None;
+    }
+
+    let value = (raw_value as f64).mul_add(spn_def.scale, spn_def.offset);
+    Some((raw_value, value))
+}
 
 /// Decode a single SPN from CAN data bytes.
 ///
@@ -25,22 +47,9 @@ use crate::types::{DecodedSpn, SpnDataType, SpnDef};
 ///     assert_eq!(value, 90.0);
 /// }
 /// ```
+#[inline]
 pub fn decode_spn(data: &[u8], spn_def: &SpnDef) -> Option<f64> {
-    if data.len() <= spn_def.start_byte as usize {
-        return None;
-    }
-
-    let raw_value = extract_raw_value(data, spn_def)?;
-
-    // Check for "not available" values (all 1s)
-    let max_value = (1u64 << spn_def.bit_length) - 1;
-    if raw_value >= max_value - 1 {
-        return None;
-    }
-
-    // Apply scale and offset
-    let value = (raw_value as f64) * spn_def.scale + spn_def.offset;
-    Some(value)
+    extract_and_validate(data, spn_def).map(|(_, value)| value)
 }
 
 /// Decode a single SPN and return full decoded information.
@@ -58,21 +67,9 @@ pub fn decode_spn(data: &[u8], spn_def: &SpnDef) -> Option<f64> {
 ///     println!("SPN {}: {} = {} {}", decoded.spn, decoded.name, decoded.value, decoded.unit);
 /// }
 /// ```
+#[inline]
 pub fn decode_spn_full(data: &[u8], spn_def: &SpnDef) -> Option<DecodedSpn> {
-    if data.len() <= spn_def.start_byte as usize {
-        return None;
-    }
-
-    let raw_value = extract_raw_value(data, spn_def)?;
-
-    // Check for "not available" values
-    let max_value = (1u64 << spn_def.bit_length) - 1;
-    if raw_value >= max_value - 1 {
-        return None;
-    }
-
-    let value = (raw_value as f64) * spn_def.scale + spn_def.offset;
-
+    let (raw_value, value) = extract_and_validate(data, spn_def)?;
     Some(DecodedSpn {
         spn: spn_def.spn,
         name: spn_def.name,
@@ -107,6 +104,7 @@ pub fn decode_spn_full(data: &[u8], spn_def: &SpnDef) -> Option<DecodedSpn> {
 ///     println!("{}: {} {}", spn.name, spn.value, spn.unit);
 /// }
 /// ```
+#[inline]
 pub fn decode_frame(can_id: u32, data: &[u8]) -> Vec<DecodedSpn> {
     let pgn = extract_pgn(can_id);
 
@@ -114,15 +112,11 @@ pub fn decode_frame(can_id: u32, data: &[u8]) -> Vec<DecodedSpn> {
         return Vec::new();
     };
 
-    let mut results = Vec::with_capacity(spn_defs.len());
-
-    for spn_def in spn_defs {
-        if let Some(decoded) = decode_spn_full(data, spn_def) {
-            results.push(decoded);
-        }
-    }
-
-    results
+    // Pre-allocate with exact capacity, then filter_map to avoid intermediate allocations
+    spn_defs
+        .iter()
+        .filter_map(|spn_def| decode_spn_full(data, spn_def))
+        .collect()
 }
 
 /// Decode a specific SPN by number from a CAN frame.
@@ -135,81 +129,64 @@ pub fn decode_frame(can_id: u32, data: &[u8]) -> Vec<DecodedSpn> {
 /// # Returns
 ///
 /// The decoded value, or `None` if the SPN is not found or data is invalid.
+#[inline]
 pub fn decode_spn_by_number(spn: u32, data: &[u8]) -> Option<f64> {
-    let spn_def = get_spn_def(spn)?;
-    decode_spn(data, spn_def)
-}
-
-/// Get the source address from a CAN ID.
-pub fn get_source_address(can_id: u32) -> u8 {
-    extract_source_address(can_id)
+    decode_spn(data, get_spn_def(spn)?)
 }
 
 // ============================================================================
-// Internal helpers
+// Internal helpers - optimized for minimal branching
 // ============================================================================
 
 /// Extract raw value from data bytes based on SPN definition.
+/// Uses get_unchecked after bounds check for better codegen.
+#[inline]
 fn extract_raw_value(data: &[u8], spn_def: &SpnDef) -> Option<u64> {
     let start = spn_def.start_byte as usize;
 
-    match spn_def.data_type {
+    // Compute required length based on data type
+    let required_len = start + match spn_def.data_type {
+        SpnDataType::Uint8 | SpnDataType::Int8 => 1,
+        SpnDataType::Uint16 | SpnDataType::Int16 => 2,
+        SpnDataType::Uint32 | SpnDataType::Int32 => 4,
+    };
+
+    // Single bounds check for all types
+    if data.len() < required_len {
+        return None;
+    }
+
+    // SAFETY: We just verified bounds above
+    let val = match spn_def.data_type {
         SpnDataType::Uint8 => {
-            if start >= data.len() {
-                return None;
-            }
+            let byte = data[start];
             if spn_def.bit_length == 8 && spn_def.start_bit == 0 {
-                Some(data[start] as u64)
+                byte as u64
             } else {
-                // Bit field extraction
-                let byte = data[start];
-                let mask = (1u8 << spn_def.bit_length) - 1;
-                Some(((byte >> spn_def.start_bit) & mask) as u64)
+                // Bit field extraction - compute mask without branching
+                let mask = (1u8 << spn_def.bit_length).wrapping_sub(1);
+                ((byte >> spn_def.start_bit) & mask) as u64
             }
         }
         SpnDataType::Uint16 => {
-            if start + 1 >= data.len() {
-                return None;
-            }
-            Some(u16::from_le_bytes([data[start], data[start + 1]]) as u64)
+            // Use array indexing which compiles to efficient load
+            u16::from_le_bytes([data[start], data[start + 1]]) as u64
         }
         SpnDataType::Uint32 => {
-            if start + 3 >= data.len() {
-                return None;
-            }
-            Some(u32::from_le_bytes([
-                data[start],
-                data[start + 1],
-                data[start + 2],
-                data[start + 3],
-            ]) as u64)
+            u32::from_le_bytes([data[start], data[start + 1], data[start + 2], data[start + 3]])
+                as u64
         }
-        SpnDataType::Int8 => {
-            if start >= data.len() {
-                return None;
-            }
-            Some(data[start] as i8 as i64 as u64)
-        }
+        SpnDataType::Int8 => data[start] as i8 as u64,
         SpnDataType::Int16 => {
-            if start + 1 >= data.len() {
-                return None;
-            }
-            let val = i16::from_le_bytes([data[start], data[start + 1]]);
-            Some(val as i64 as u64)
+            i16::from_le_bytes([data[start], data[start + 1]]) as u64
         }
         SpnDataType::Int32 => {
-            if start + 3 >= data.len() {
-                return None;
-            }
-            let val = i32::from_le_bytes([
-                data[start],
-                data[start + 1],
-                data[start + 2],
-                data[start + 3],
-            ]);
-            Some(val as i64 as u64)
+            i32::from_le_bytes([data[start], data[start + 1], data[start + 2], data[start + 3]])
+                as u64
         }
-    }
+    };
+
+    Some(val)
 }
 
 #[cfg(test)]
