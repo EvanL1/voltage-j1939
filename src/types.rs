@@ -4,6 +4,13 @@
 //! - `Copy` where possible to avoid heap allocations
 //! - `#[repr(u8)]` for enums to minimize size
 //! - Fields ordered by size to minimize padding
+//!
+//! # Compile-time guarantees
+//!
+//! This module uses const assertions to guarantee:
+//! - `SpnDataType` is exactly 1 byte
+//! - `J1939Id` fits in 8 bytes
+//! - `DecodedSpn` fits in a cache line (64 bytes)
 
 /// Data type for SPN values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,8 +32,10 @@ pub enum SpnDataType {
 
 impl SpnDataType {
     /// Returns the number of bytes required to store this data type.
-    #[inline]
+    /// Hot path: always inlined, computed at compile time when possible.
+    #[inline(always)]
     pub const fn byte_size(self) -> usize {
+        // Use a match table that the compiler can optimize to a simple lookup
         match self {
             Self::Uint8 | Self::Int8 => 1,
             Self::Uint16 | Self::Int16 => 2,
@@ -35,9 +44,17 @@ impl SpnDataType {
     }
 
     /// Returns true if this is a signed type.
-    #[inline]
+    /// Const fn for compile-time evaluation.
+    #[inline(always)]
     pub const fn is_signed(self) -> bool {
+        // Compiler optimizes this to a simple bit check on repr(u8) value
         matches!(self, Self::Int8 | Self::Int16 | Self::Int32)
+    }
+
+    /// Returns the bit size for this data type (always 8 * byte_size).
+    #[inline(always)]
+    pub const fn bit_size(self) -> u8 {
+        (self.byte_size() * 8) as u8
     }
 }
 
@@ -324,3 +341,22 @@ mod tests {
         assert_eq!(def1.scale, def2.scale);
     }
 }
+
+// ============================================================================
+// Compile-time size assertions - ensure optimal memory layout
+// ============================================================================
+
+const _: () = {
+    // SpnDataType must be exactly 1 byte (repr(u8))
+    assert!(std::mem::size_of::<SpnDataType>() == 1);
+
+    // J1939Id should fit in 8 bytes for efficient copying
+    assert!(std::mem::size_of::<J1939Id>() <= 8);
+
+    // DecodedSpn should fit in a cache line (64 bytes)
+    assert!(std::mem::size_of::<DecodedSpn>() <= 64);
+
+    // SpnDef should be reasonably sized (contains 2 static refs + primitives)
+    // On 64-bit: 2*f64(16) + 2*u32(8) + 2*&str(32) + 4*u8(4) = 60 bytes + padding
+    assert!(std::mem::size_of::<SpnDef>() <= 72);
+};
